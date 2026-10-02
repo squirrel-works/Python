@@ -18,18 +18,27 @@ saved at. To correct for this, each image gets a cheap complexity
 probe: encode a downscaled thumbnail at a fixed quality, then scale the
 byte count up by (original_pixels / thumbnail_pixels) to estimate
 "bytes this image would need at a fixed quality, at full resolution."
-Only genuine .jpg/.jpeg source files get the cheap path for this --
-Image.draft() has libjpeg decode directly at a reduced scale, skipping
-a full decode. Every other format (PNG, BMP, GIF, TIFF, WEBP, HEIC)
-doesn't support draft-mode scaled decoding, so the probe does a full
-decode followed by an explicit resize -- slower per file, but correct.
+Formats with draft-mode scaled decoding (JPEG, and HEIC via pillow-heif)
+get the cheap path for this -- Image.draft() decodes directly at a
+reduced scale, skipping a full decode. Every other format (PNG, BMP,
+GIF, TIFF, WEBP) gets a full decode -- slower per file, but correct.
+Either way the result is resized to the same thumbnail bound, so
+estimates are comparable across formats.
 
-Transparency: images with an alpha channel are composited onto a white
-background before conversion to RGB. A plain mode conversion to RGB
-would just discard the alpha channel and keep whatever RGB values sit
-underneath it, which for many PNGs/GIFs are garbage or black -- that
-produces a visibly wrong result rather than the sane white-background
-flattening most people expect from a JPEG conversion.
+Transparency: images with an alpha channel or a transparent colour key
+are composited onto a white background before conversion to RGB. A
+plain mode conversion to RGB would just discard the transparency and
+keep whatever RGB values sit underneath it, which for many PNGs/GIFs
+are garbage or black -- that produces a visibly wrong result rather
+than the sane white-background flattening most people expect from a
+JPEG conversion.
+
+Orientation and colour: re-encoded JPEGs carry no EXIF, so the EXIF
+orientation is baked into the pixels first -- otherwise phone photos
+come out sideways. An RGB ICC profile (e.g. Display P3 on iPhone
+photos) is carried over so colours don't shift; gray/CMYK profiles no
+longer describe the converted RGB pixels and are dropped. 16-bit
+grayscale is scaled to 8-bit rather than clipped.
 
 Animation: GIF, animated WEBP, and multi-page TIFF are flattened to
 their first frame -- JPEG has no concept of animation. This is logged
@@ -39,11 +48,14 @@ Each image is shrunk (quality first, then dimensions) in parallel
 worker processes, and the results are packed into shrunk_images.zip
 using ZIP_STORED -- the source data is either already-compressed
 (JPEG/HEIC) or about to be freshly JPEG-encoded, so DEFLATE would
-spend CPU for no benefit either way.
+spend CPU for no benefit either way. The size budget reserves an upper
+bound for the zip's own per-entry metadata.
 
 Non-destructive: originals are never modified. Shrunk copies are
 produced in a temp directory and packed into the zip; the temp
-directory is cleaned up automatically.
+directory is cleaned up automatically. The zip itself is written to a
+temp name and renamed into place, so a failed run never leaves a
+truncated zip behind.
 
 Dependency note: HEIC decoding is not built into Pillow. This script
 requires the `pillow-heif` package (`pip install pillow-heif`) only for
@@ -56,15 +68,18 @@ from __future__ import annotations
 
 import argparse
 import io
+import itertools
 import logging
+import math
 import os
 import sys
 import tempfile
 import zipfile
+from collections.abc import Iterable
 from concurrent.futures import ProcessPoolExecutor, as_completed
 from pathlib import Path
 
-from PIL import Image
+from PIL import Image, ImageOps
 
 try:
     import pillow_heif
@@ -77,27 +92,63 @@ except ImportError:
 logger = logging.getLogger("shrink_jpegs")
 
 MIN_QUALITY = 20
+MAX_QUALITY = 95
 QUALITY_STEP = 5
 DIM_SCALE_FACTOR = 0.9
 MAX_DIM_ITERATIONS = 10
+MIN_DIM = 50
 
 JPEG_SUFFIXES = (".jpg", ".jpeg")
 HEIF_SUFFIXES = (".heic", ".heif")
 OTHER_RASTER_SUFFIXES = (".png", ".bmp", ".gif", ".tif", ".tiff", ".webp")
 ALL_SUFFIXES = JPEG_SUFFIXES + HEIF_SUFFIXES + OTHER_RASTER_SUFFIXES
 
+# Pillow format names whose bytes are already a valid JPEG. MPO is a JPEG
+# with extra embedded images appended (e.g. iPhone portrait depth maps).
+JPEG_FORMATS = ("JPEG", "MPO")
+
 PROBE_MAX_DIM = 400
 PROBE_QUALITY = 75
 
+# Upper bounds on zip bytes outside the file data. Per entry: local header
+# (30) + central directory header (46) + worst-case zip64 extra fields
+# (20 + 28) + data descriptor (24), plus the name stored twice. Per
+# archive: end-of-central-directory record (22) + zip64 end record and
+# locator (56 + 20).
+ZIP_ENTRY_OVERHEAD = 30 + 46 + 20 + 28 + 24
+ZIP_END_OVERHEAD = 22 + 56 + 20
+
 
 def is_native_jpeg(path: Path) -> bool:
-    """True only for genuine .jpg/.jpeg source files.
+    """True for .jpg/.jpeg file names.
 
-    This is the one format that gets the draft-mode fast decode and the
-    copy-unchanged fast path -- every other input format always needs a
-    real re-encode since the output is always JPEG.
+    Used for naming: these keep their name in the zip, everything else is
+    renamed to .jpg. Whether a file can be copied unchanged is decided
+    from its decoded format instead, so a mislabeled PNG still gets
+    re-encoded.
     """
     return path.suffix.lower() in JPEG_SUFFIXES
+
+
+def zip_overhead_bytes(arcnames: Iterable[str]) -> int:
+    """Upper bound on a ZIP_STORED archive's size beyond its file data."""
+    return ZIP_END_OVERHEAD + sum(
+        ZIP_ENTRY_OVERHEAD + 2 * len(name.encode("utf-8")) for name in arcnames
+    )
+
+
+def rgb_icc_profile(img: Image.Image) -> bytes | None:
+    """Return img's embedded ICC profile if it describes an RGB colour space.
+
+    Output is always RGB, so an RGB source profile (e.g. Display P3 on
+    iPhone photos) still describes the pixels and has to be carried over
+    or colours shift. Gray/CMYK profiles don't match the converted pixels.
+    """
+    icc = img.info.get("icc_profile")
+    # Bytes 16-19 of an ICC header are the data colour space signature.
+    if isinstance(icc, bytes) and icc[16:20] == b"RGB ":
+        return icc
+    return None
 
 
 def load_as_rgb(img: Image.Image) -> Image.Image:
@@ -107,11 +158,17 @@ def load_as_rgb(img: Image.Image) -> Image.Image:
     channel and keeps whatever RGB values sit underneath it -- for many
     PNGs/GIFs those pixels are garbage colors (often black), producing a
     visibly wrong result. Compositing onto white first gives a sane,
-    predictable flattening instead.
+    predictable flattening instead. Transparency can come from an alpha
+    band (RGBA/LA/PA) or a colour key in img.info (palette images and
+    tRNS-keyed L/RGB PNGs).
+
+    16-bit grayscale is scaled to 8-bit first -- Pillow's own conversion
+    clips everything above 255, washing the image out to white.
     """
-    has_alpha = img.mode in ("RGBA", "LA") or (
-        img.mode == "P" and "transparency" in img.info
-    )
+    if img.mode == "I" or img.mode.startswith("I;16"):
+        img = img.convert("I").point(lambda v: v * (1 / 256)).convert("L")
+
+    has_alpha = img.mode in ("RGBA", "LA", "PA") or "transparency" in img.info
     if not has_alpha:
         return img.convert("RGB")
 
@@ -124,40 +181,37 @@ def load_as_rgb(img: Image.Image) -> Image.Image:
 def estimate_complexity_weight(path: Path) -> tuple[int, str | None]:
     """Estimate a fair-share weight for one image based on encode complexity.
 
-    For genuine JPEG input, Image.draft() has libjpeg decode directly at
-    a reduced scale (1/2, 1/4, or 1/8) instead of a full decode -- this
-    is what keeps the probe cheap relative to the real shrink pass. All
-    other formats (PNG, BMP, GIF, TIFF, WEBP, HEIC) don't support
-    draft-mode scaled decoding, so they get a full decode followed by an
-    explicit thumbnail resize -- slower per file, but the estimate is
-    still correct. The scaled-down image is encoded once at a fixed
-    quality (not searched), and the resulting byte count is scaled up
-    by (original_pixels / thumbnail_pixels) to estimate "bytes this
-    image would need at a fixed quality, at full resolution."
+    For JPEG (and HEIC via pillow-heif) input, Image.draft() decodes
+    directly at a reduced scale instead of a full decode -- this is what
+    keeps the probe cheap relative to the real shrink pass. Other formats
+    ignore draft() and get a full decode -- slower per file, but the
+    estimate is still correct. Every format is then thumbnailed to the
+    same bound, since draft only scales in coarse steps (1/2-1/8) and
+    bytes-per-pixel varies with resolution. The thumbnail is encoded once
+    at a fixed quality (not searched), and the resulting byte count is
+    scaled up by (original_pixels / thumbnail_pixels) to estimate "bytes
+    this image would need at a fixed quality, at full resolution."
 
     Returns (weight_bytes, error_or_None). Callers should fall back to
     on-disk file size as the weight if error is not None.
     """
     try:
-        img = Image.open(path)
-        native_jpeg = is_native_jpeg(path)
-        original_w, original_h = img.size  # header read only, no decode yet
-        original_pixels = original_w * original_h
-        if original_pixels == 0:
-            raise ValueError("zero-pixel image")
+        with Image.open(path) as img:
+            original_w, original_h = img.size  # header read only, no decode yet
+            original_pixels = original_w * original_h
+            if original_pixels == 0:
+                raise ValueError("zero-pixel image")
 
-        if native_jpeg:
             img.draft("RGB", (PROBE_MAX_DIM, PROBE_MAX_DIM))
-        img = load_as_rgb(img)
-        if not native_jpeg:
-            img.thumbnail((PROBE_MAX_DIM, PROBE_MAX_DIM), Image.LANCZOS)
+            thumb = load_as_rgb(img)
+        thumb.thumbnail((PROBE_MAX_DIM, PROBE_MAX_DIM), Image.LANCZOS)
 
-        thumb_pixels = img.size[0] * img.size[1]
+        thumb_pixels = thumb.size[0] * thumb.size[1]
         if thumb_pixels == 0:
             raise ValueError("thumbnail collapsed to zero pixels")
 
         buf = io.BytesIO()
-        img.save(buf, format="JPEG", quality=PROBE_QUALITY)
+        thumb.save(buf, format="JPEG", quality=PROBE_QUALITY)
         thumb_bytes = buf.tell()
 
         weight = int(thumb_bytes * (original_pixels / thumb_pixels))
@@ -222,87 +276,121 @@ def compute_fair_share_targets(
     return targets
 
 
+def _encode_jpeg(img: Image.Image, quality: int, icc_profile: bytes | None) -> bytes:
+    buf = io.BytesIO()
+    img.save(
+        buf, format="JPEG", quality=quality, optimize=True, icc_profile=icc_profile,
+    )
+    return buf.getvalue()
+
+
+def _write_atomic(path: Path, data: bytes) -> None:
+    """Write via a sibling temp file + rename, so path is never left truncated."""
+    tmp_path = path.with_name(path.name + ".tmp_shrink")
+    try:
+        tmp_path.write_bytes(data)
+        tmp_path.replace(path)
+    finally:
+        tmp_path.unlink(missing_ok=True)
+
+
 def compress_to_target(
     src_path: Path, final_dst_path: Path, target_bytes: int
 ) -> tuple[bool, int]:
     """Compress/convert a single image to a JPEG under target_bytes.
 
+    JPEG data that already fits is copied byte-for-byte. Everything else
+    is re-encoded: quality first, then dimensions, each downscale jumping
+    toward the size the byte overshoot implies.
+
     Always writes to a temp file next to final_dst_path first, then
     renames into place on success -- this is safe even when
-    final_dst_path == src_path, since we never truncate the source
-    file we're still reading pixel data from mid-loop.
+    final_dst_path == src_path, since the source is fully decoded before
+    anything is written.
 
     Returns (success, final_size_bytes). final_dst_path is only
     written if a passing result is found.
     """
-    native_jpeg = is_native_jpeg(src_path)
+    if target_bytes < 0:
+        raise ValueError(f"target_bytes must be non-negative: {target_bytes}")
 
+    final_dst_path.parent.mkdir(parents=True, exist_ok=True)
+
+    img: Image.Image | None = None  # stays None on the copy-unchanged path
+    icc_profile: bytes | None = None
     try:
-        img = Image.open(src_path)
-        n_frames = getattr(img, "n_frames", 1)
-        if n_frames > 1:
-            logger.warning(
-                "'%s' has %d frames -- using the first frame only, "
-                "JPEG output can't preserve animation",
-                src_path, n_frames,
-            )
-        img = load_as_rgb(img)
+        with Image.open(src_path) as src_img:
+            # Decided from the decoded format, not the suffix -- a PNG named
+            # .jpg must still be re-encoded, since the output must be JPEG.
+            is_jpeg = src_img.format in JPEG_FORMATS
+            if not (is_jpeg and src_path.stat().st_size <= target_bytes):
+                n_frames = getattr(src_img, "n_frames", 1)
+                if n_frames > 1 and not is_jpeg:
+                    logger.warning(
+                        "'%s' has %d frames -- using the first frame only, "
+                        "JPEG output can't preserve animation",
+                        src_path, n_frames,
+                    )
+                icc_profile = rgb_icc_profile(src_img)
+                img = load_as_rgb(ImageOps.exif_transpose(src_img))
     except Exception as exc:
         raise OSError(f"failed to open '{src_path}': {exc}") from exc
 
-    original_size = src_path.stat().st_size
-    # Only genuine JPEG input gets the raw-copy fast path -- every other
-    # format must always be re-encoded regardless of its original size,
-    # since the output format itself is changing.
-    if native_jpeg and original_size <= target_bytes:
+    if img is None:
+        data = src_path.read_bytes()
         logger.info(
             "'%s' already %d bytes (<= target %d), copying unchanged",
-            src_path, original_size, target_bytes,
+            src_path, len(data), target_bytes,
         )
         if final_dst_path != src_path:
-            final_dst_path.write_bytes(src_path.read_bytes())
-        return True, original_size
+            _write_atomic(final_dst_path, data)
+        return True, len(data)
 
-    tmp_path = final_dst_path.with_suffix(final_dst_path.suffix + ".tmp_shrink")
     current_img = img
-    dim_iteration = 0
-
-    try:
-        while dim_iteration <= MAX_DIM_ITERATIONS:
-            quality = 95
-            while quality >= MIN_QUALITY:
-                current_img.save(tmp_path, format="JPEG", quality=quality, optimize=True)
-                size = tmp_path.stat().st_size
-                if size <= target_bytes:
-                    tmp_path.replace(final_dst_path)
-                    logger.info(
-                        "'%s' -> %d bytes at quality=%d, dims=%s",
-                        src_path, size, quality, current_img.size,
-                    )
-                    return True, size
-                quality -= QUALITY_STEP
-
-            # Quality alone didn't get there; downscale dimensions and retry.
-            dim_iteration += 1
-            new_w = int(current_img.width * DIM_SCALE_FACTOR)
-            new_h = int(current_img.height * DIM_SCALE_FACTOR)
-            if new_w < 50 or new_h < 50:
-                break
-            current_img = current_img.resize((new_w, new_h), Image.LANCZOS)
-            logger.debug(
-                "'%s' still over target after quality pass, downscaling to %dx%d",
-                src_path, new_w, new_h,
+    smallest = 0
+    for _ in range(MAX_DIM_ITERATIONS + 1):
+        # Size falls with quality, so one encode at the floor shows whether
+        # any quality can fit at these dimensions before searching down.
+        floor_data = _encode_jpeg(current_img, MIN_QUALITY, icc_profile)
+        if len(floor_data) <= target_bytes:
+            data, quality = floor_data, MIN_QUALITY
+            for q in range(MAX_QUALITY, MIN_QUALITY, -QUALITY_STEP):
+                candidate = _encode_jpeg(current_img, q, icc_profile)
+                if len(candidate) <= target_bytes:
+                    data, quality = candidate, q
+                    break
+            _write_atomic(final_dst_path, data)
+            logger.info(
+                "'%s' -> %d bytes at quality=%d, dims=%s",
+                src_path, len(data), quality, current_img.size,
             )
+            return True, len(data)
+        smallest = len(floor_data)
 
-        # Failed to hit target even at min quality + min dimensions.
-        final_size = tmp_path.stat().st_size if tmp_path.exists() else original_size
-        logger.error(
-            "'%s' could not be shrunk below %d bytes (best: %d bytes at min quality/dims)",
-            src_path, target_bytes, final_size,
+        # Quality alone didn't get there; downscale dimensions and retry.
+        # Size scales roughly with pixel count, so jump to the linear scale
+        # the overshoot implies (with DIM_SCALE_FACTOR as margin) rather than
+        # fixed steps, which run out of iterations on heavy reductions. Never
+        # go below MIN_DIM, and resample from the full-size image so blur
+        # doesn't compound across steps.
+        w, h = current_img.size
+        step = DIM_SCALE_FACTOR * math.sqrt(target_bytes / len(floor_data))
+        step = max(step, MIN_DIM / min(w, h))
+        if step >= 1:
+            break
+        new_w, new_h = max(1, round(w * step)), max(1, round(h * step))
+        current_img = img.resize((new_w, new_h), Image.LANCZOS)
+        logger.debug(
+            "'%s' still over target after quality pass, downscaling to %dx%d",
+            src_path, new_w, new_h,
         )
-        return False, final_size
-    finally:
-        tmp_path.unlink(missing_ok=True)
+
+    # Failed to hit target even at min quality + min dimensions.
+    logger.error(
+        "'%s' could not be shrunk below %d bytes (best: %d bytes at min quality/dims)",
+        src_path, target_bytes, smallest,
+    )
+    return False, smallest
 
 
 def _worker_init(log_level: int) -> None:
@@ -332,6 +420,10 @@ def _process_one(
         return ok, size, None
     except OSError as exc:
         return False, 0, str(exc)
+    except Exception as exc:
+        # Anything else (decoder bug, MemoryError) is reported against its
+        # own file instead of aborting the whole run.
+        return False, 0, f"failed to process '{src_path}': {exc!r}"
 
 
 def main() -> int:
@@ -359,12 +451,12 @@ def main() -> int:
         help="Recurse into subdirectories",
     )
     parser.add_argument(
-        "--workers", type=int, default=50,
+        "--workers", type=int, default=None,
         help=(
-            "Max images to process concurrently (default: 50). This is "
-            "CPU-bound work -- throughput plateaus at your core count "
-            "(detected and logged at startup); workers beyond that just "
-            "use extra memory without going faster."
+            "Max images to process concurrently (default: CPU core count). "
+            "This is CPU-bound work and each worker holds a fully decoded "
+            "image in memory -- workers beyond core count just use extra "
+            "memory without going faster."
         ),
     )
     parser.add_argument(
@@ -372,20 +464,30 @@ def main() -> int:
     )
     args = parser.parse_args()
 
+    if not math.isfinite(args.target_zip_mb) or args.target_zip_mb <= 0:
+        parser.error("--target-zip-mb must be a finite number greater than 0")
+    if args.workers is not None and args.workers < 1:
+        parser.error("--workers must be at least 1")
+
     logging.basicConfig(
         level=logging.DEBUG if args.verbose else logging.INFO,
         format="%(asctime)s [%(levelname)s] %(message)s",
     )
+
+    if args.output.exists() and args.output.is_dir():
+        logger.error("output path '%s' is a directory, not a file", args.output)
+        return 1
 
     if not args.input_dir.is_dir():
         logger.error("input_dir '%s' is not a directory", args.input_dir)
         return 1
 
     pattern = "**/*" if args.recursive else "*"
-    files = [
+    # Sorted so zip names, collision resolution, and logs are deterministic.
+    files = sorted(
         p for p in args.input_dir.glob(pattern)
-        if p.is_file() and p.suffix.lower() in ALL_SUFFIXES
-    ]
+        if p.suffix.lower() in ALL_SUFFIXES and p.is_file()
+    )
 
     heif_files_present = any(p.suffix.lower() in HEIF_SUFFIXES for p in files)
     if heif_files_present and not HEIF_SUPPORT:
@@ -401,8 +503,15 @@ def main() -> int:
         )
         return 0
 
+    # The zip is renamed into place at the end -- never onto a source image.
+    output_resolved = args.output.resolve()
+    if any(p.resolve() == output_resolved for p in files):
+        logger.error("output path '%s' is one of the input images", args.output)
+        return 1
+
     cpu_count = os.cpu_count() or 1
-    workers = max(1, min(args.workers, len(files)))
+    requested_workers = cpu_count if args.workers is None else args.workers
+    workers = min(requested_workers, len(files))
     logger.info(
         "%d worker(s) requested (%d CPU cores detected)", workers, cpu_count,
     )
@@ -416,6 +525,51 @@ def main() -> int:
     file_sizes = {p: p.stat().st_size for p in files}
     current_total = sum(file_sizes.values())
 
+    # Zip names. Multiple source formats can share a stem (e.g. photo.bmp
+    # and photo.webp both naively becoming photo.jpg), so only
+    # disambiguate on an actual collision -- keeps the common single-
+    # format case's output names clean. Native JPEGs are named first so
+    # they keep their real names, and collisions are checked
+    # case-insensitively since the zip will often be extracted onto a
+    # case-insensitive filesystem (photo.JPG vs photo.png -> photo.jpg).
+    arcnames: dict[Path, str] = {}
+    used_keys: set[str] = set()
+    for src in sorted(files, key=lambda p: not is_native_jpeg(p)):
+        rel = src.relative_to(args.input_dir)
+        natural = rel if is_native_jpeg(src) else rel.with_suffix(".jpg")
+        candidates = itertools.chain(
+            [natural, natural.parent / f"{rel.name}.jpg"],
+            (natural.parent / f"{rel.name}_{i}.jpg" for i in itertools.count(2)),
+        )
+        arcname = next(
+            c.as_posix() for c in candidates
+            if c.as_posix().casefold() not in used_keys
+        )
+        if arcname != natural.as_posix():
+            logger.warning(
+                "'%s' -- name collision in the zip against another file's "
+                "'%s', writing as '%s' instead",
+                src, natural.as_posix(), arcname,
+            )
+        used_keys.add(arcname.casefold())
+        arcnames[src] = arcname
+
+    target_zip_bytes = int(args.target_zip_mb * 1_000_000)
+    # Reserve headroom for zip metadata (local headers, central directory)
+    # -- small per file, but scales with file count and name length, so
+    # never less than the computed upper bound.
+    safety_margin = max(
+        50_000, int(target_zip_bytes * 0.01), zip_overhead_bytes(arcnames.values()),
+    )
+    total_budget = target_zip_bytes - safety_margin
+    if total_budget <= 0:
+        logger.error(
+            "--target-zip-mb %g is too small: it must exceed the %d bytes "
+            "reserved for zip metadata (%d file(s))",
+            args.target_zip_mb, safety_margin, len(files),
+        )
+        return 1
+
     # Complexity probe pass -- cheap relative to the real shrink pass,
     # run through the same worker pool.
     weights: dict[Path, int] = {}
@@ -427,7 +581,11 @@ def main() -> int:
     ) as executor:
         futures = {executor.submit(_probe_one, p): p for p in files}
         for future in as_completed(futures):
-            path, weight, err = future.result()
+            path = futures[future]
+            try:
+                _, weight, err = future.result()
+            except Exception as exc:  # e.g. worker killed by the OS
+                weight, err = 0, f"complexity probe failed for '{path}': {exc!r}"
             if err or weight <= 0:
                 if err:
                     logger.debug("%s -- falling back to file size as weight", err)
@@ -442,22 +600,20 @@ def main() -> int:
             probe_failures, len(files),
         )
 
-    target_zip_bytes = int(args.target_zip_mb * 1_000_000)
-    # Reserve headroom for zip metadata (local headers, central directory)
-    # -- small per file, but scales with file count.
-    safety_margin = max(50_000, int(target_zip_bytes * 0.01))
-    total_budget = target_zip_bytes - safety_margin
-
     per_file_targets = compute_fair_share_targets(file_sizes, weights, total_budget)
 
     logger.info(
         "%d files, %d bytes (%.1f MB) currently, packing to fit <= %.1f MB zip",
         len(files), current_total, current_total / 1_000_000, args.target_zip_mb,
     )
-    already_fitting = sum(1 for p in files if per_file_targets[p] == file_sizes[p])
+    # Only JPEGs can be copied as-is; everything else is always re-encoded.
+    already_fitting = sum(
+        1 for p in files
+        if is_native_jpeg(p) and per_file_targets[p] == file_sizes[p]
+    )
     logger.info(
-        "%d file(s) already within their complexity-weighted fair share and "
-        "won't be re-encoded; %d will be shrunk",
+        "%d JPEG(s) already within their complexity-weighted fair share and "
+        "won't be re-encoded; %d file(s) will be shrunk or converted",
         already_fitting, len(files) - already_fitting,
     )
 
@@ -466,53 +622,28 @@ def main() -> int:
     failures = 0
     with tempfile.TemporaryDirectory(prefix="shrink_jpegs_") as tmp_dir_str:
         tmp_dir = Path(tmp_dir_str)
-
-        # (src_path, tmp_dst_path, arcname) for every file. Arcnames are
-        # deduplicated: multiple source formats can share a stem (e.g.
-        # photo.bmp and photo.webp both naively becoming photo.jpg), so
-        # only disambiguate on an actual collision -- keeps the common
-        # single-format case's output names clean.
-        used_arcnames: set[Path] = set()
-        tasks: list[tuple[Path, Path, Path]] = []
-        for src in files:
-            rel = src.relative_to(args.input_dir)
-            arcname = rel if is_native_jpeg(src) else rel.with_suffix(".jpg")
-
-            if arcname in used_arcnames:
-                disambiguated = arcname.parent / f"{rel.name}.jpg"
-                if disambiguated in used_arcnames:
-                    i = 2
-                    while disambiguated in used_arcnames:
-                        disambiguated = arcname.parent / f"{rel.name}_{i}.jpg"
-                        i += 1
-                logger.warning(
-                    "'%s' -- name collision in the zip against another file's "
-                    "'%s', writing as '%s' instead",
-                    src, arcname, disambiguated,
-                )
-                arcname = disambiguated
-
-            used_arcnames.add(arcname)
-            tmp_dst = tmp_dir / arcname
-            tmp_dst.parent.mkdir(parents=True, exist_ok=True)
-            tasks.append((src, tmp_dst, arcname))
-
-        successes: list[Path] = []  # tmp paths to zip up
+        # Index-based temp names, not zip names: on a case-insensitive
+        # filesystem two distinct zip names could map to the same temp file.
+        tmp_dsts = {src: tmp_dir / f"{i}.jpg" for i, src in enumerate(files)}
+        successes: list[Path] = []  # sources whose shrunk copy goes in the zip
 
         with ProcessPoolExecutor(
             max_workers=workers,
             initializer=_worker_init,
             initargs=(logging.DEBUG if args.verbose else logging.INFO,),
         ) as executor:
-            future_to_task = {
-                executor.submit(_process_one, src, tmp_dst, per_file_targets[src]): (
-                    src, tmp_dst,
-                )
-                for src, tmp_dst, _arcname in tasks
+            future_to_src = {
+                executor.submit(
+                    _process_one, src, tmp_dsts[src], per_file_targets[src],
+                ): src
+                for src in files
             }
-            for future in as_completed(future_to_task):
-                src, tmp_dst = future_to_task[future]
-                ok, _size, err = future.result()
+            for future in as_completed(future_to_src):
+                src = future_to_src[future]
+                try:
+                    ok, _size, err = future.result()
+                except Exception as exc:  # e.g. worker killed by the OS
+                    ok, err = False, f"failed to process '{src}': {exc!r}"
                 if err:
                     logger.error("%s", err)
                     failures += 1
@@ -524,29 +655,37 @@ def main() -> int:
                     )
                     failures += 1
                 else:
-                    successes.append(tmp_dst)
+                    successes.append(src)
 
         if not successes:
             logger.error("no images were successfully shrunk -- nothing to zip")
             return 1
 
-        with zipfile.ZipFile(args.output, "w", compression=zipfile.ZIP_STORED) as zf:
-            for tmp_dst in successes:
-                arcname = tmp_dst.relative_to(tmp_dir)
-                zf.write(tmp_dst, arcname=arcname)
+        # Write under a temp name and rename into place, so a failed or
+        # interrupted run never leaves a truncated zip at the output path.
+        tmp_zip = args.output.with_name(f".{args.output.name}.{os.getpid()}.tmp")
+        try:
+            with zipfile.ZipFile(tmp_zip, "w", compression=zipfile.ZIP_STORED) as zf:
+                for src in sorted(successes, key=arcnames.__getitem__):
+                    zf.write(tmp_dsts[src], arcname=arcnames[src])
+            tmp_zip.replace(args.output)
+        finally:
+            tmp_zip.unlink(missing_ok=True)
 
     final_zip_size = args.output.stat().st_size
     logger.info(
         "wrote '%s': %d bytes (%.1f MB), %d/%d images included",
         args.output, final_zip_size, final_zip_size / 1_000_000,
-        len(files) - failures, len(files),
+        len(successes), len(files),
     )
     if final_zip_size > target_zip_bytes:
-        logger.warning(
-            "final zip (%.1f MB) is over the %.1f MB target -- likely because "
-            "some images couldn't be shrunk enough at minimum quality/dimensions",
-            final_zip_size / 1_000_000, args.target_zip_mb,
+        # Every included file met its target and the metadata reserve is an
+        # upper bound, so this means a source changed mid-run or a bug.
+        logger.error(
+            "final zip (%d bytes) is over the %d byte target",
+            final_zip_size, target_zip_bytes,
         )
+        return 1
 
     return 1 if failures else 0
 
